@@ -1,0 +1,326 @@
+name: PC Gamer na Nuvem (Azure + Tailscale)
+
+# Secrets necessários: AZURE_CREDENTIALS, VM_ADMIN_PASSWORD, TAILSCALE_AUTH_KEY
+
+on:
+  workflow_dispatch:
+    inputs:
+      acao:
+        description: "Operação a executar"
+        type: choice
+        required: true
+        default: status
+        options:
+          - criar
+          - status
+          - ligar
+          - desligar
+          - reiniciar
+          - destruir
+      nome_vm:
+        description: "Nome da VM (máx. 15 caracteres)"
+        type: string
+        default: pc-gamer
+      grupo_recursos:
+        description: "Resource group do Azure"
+        type: string
+        default: rg-pc-gamer
+      regiao:
+        description: "Região do Azure"
+        type: choice
+        default: eastus
+        options:
+          - eastus
+          - eastus2
+          - westus2
+          - westus3
+          - southcentralus
+          - northeurope
+          - westeurope
+          - brazilsouth
+      tamanho_vm:
+        description: "Tamanho da VM (GPU NVIDIA)"
+        type: choice
+        default: Standard_NV6ads_A10_v5
+        options:
+          - Standard_NV6ads_A10_v5
+          - Standard_NV12ads_A10_v5
+          - Standard_NV18ads_A10_v5
+          - Standard_NV36ads_A10_v5
+          - Standard_NC4as_T4_v3
+          - Standard_NC8as_T4_v3
+      disco_gb:
+        description: "Disco SSD do Windows (GB)"
+        type: string
+        default: "300"
+      usuario_admin:
+        description: "Usuário administrador do Windows"
+        type: string
+        default: gamer
+      confirmar_destruir:
+        description: "Para 'destruir', digite DESTRUIR"
+        type: string
+        default: ""
+
+concurrency:
+  group: pc-gamer-${{ inputs.nome_vm }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ACAO: ${{ inputs.acao }}
+  VM: ${{ inputs.nome_vm }}
+  RG: ${{ inputs.grupo_recursos }}
+  LOC: ${{ inputs.regiao }}
+  SIZE: ${{ inputs.tamanho_vm }}
+  DISK_GB: ${{ inputs.disco_gb }}
+  ADMIN_USER: ${{ inputs.usuario_admin }}
+
+jobs:
+  gerenciar:
+    name: ${{ inputs.acao }} → ${{ inputs.nome_vm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Validar entradas
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! [[ "$VM" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,14}$ ]]; then
+            echo "::error::Nome da VM inválido."; exit 1
+          fi
+          if ! [[ "$DISK_GB" =~ ^[0-9]+$ ]] || [ "$DISK_GB" -lt 127 ] || [ "$DISK_GB" -gt 4095 ]; then
+            echo "::error::disco_gb deve ser entre 127 e 4095."; exit 1
+          fi
+          if [ "$ACAO" = "criar" ]; then
+            [ -n "${{ secrets.VM_ADMIN_PASSWORD }}" ] || { echo "::error::Secret VM_ADMIN_PASSWORD não configurado."; exit 1; }
+            [ -n "${{ secrets.TAILSCALE_AUTH_KEY }}" ] || { echo "::error::Secret TAILSCALE_AUTH_KEY não configurado."; exit 1; }
+          fi
+          [ -n "${{ secrets.AZURE_CREDENTIALS }}" ] || { echo "::error::Secret AZURE_CREDENTIALS não configurado."; exit 1; }
+          if [ "$ACAO" = "destruir" ] && [ "${{ inputs.confirmar_destruir }}" != "DESTRUIR" ]; then
+            echo "::error::Para destruir, preencha confirmar_destruir com DESTRUIR."; exit 1
+          fi
+
+      - name: Login no Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Verificar GPU, restrições e cota
+        if: inputs.acao == 'criar'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if az vm show -g "$RG" -n "$VM" >/dev/null 2>&1; then
+            echo "::error::A VM $VM já existe em $RG."; exit 1
+          fi
+
+          SKU_JSON=$(az vm list-skus -l "$LOC" --size "$SIZE" --resource-type virtualMachines -o json)
+          if [ "$(echo "$SKU_JSON" | jq 'length')" = "0" ]; then
+            echo "::error::O tamanho $SIZE NÃO existe em $LOC. Sem GPU disponível lá."; exit 1
+          fi
+
+          RESTR=$(echo "$SKU_JSON" | jq '[.[0].restrictions[]? | select(.type=="Location" or .type=="Zone")] | length')
+          if [ "$RESTR" != "0" ]; then
+            echo "::error::O tamanho $SIZE está RESTRITO na sua assinatura em $LOC (sem GPU disponível)."; exit 1
+          fi
+
+          FAMILY=$(echo "$SKU_JSON" | jq -r '.[0].family')
+          SIZE_INFO=$(az vm list-sizes -l "$LOC" --query "[?name=='$SIZE'] | [0]" -o json)
+          CORES=$(echo "$SIZE_INFO" | jq -r '.numberOfCores')
+          RAM_MB=$(echo "$SIZE_INFO" | jq -r '.memoryInMb')
+          RAM_GB=$(( RAM_MB / 1024 ))
+
+          USAGE=$(az vm list-usage -l "$LOC" --query "[?name.value=='$FAMILY'] | [0]" -o json)
+          if [ "$USAGE" = "null" ] || [ -z "$USAGE" ]; then
+            echo "::error::Sem informação de cota para $FAMILY em $LOC."; exit 1
+          fi
+          LIMIT=$(echo "$USAGE" | jq -r '.limit')
+          USED=$(echo "$USAGE" | jq -r '.currentValue')
+          FREE=$(( LIMIT - USED ))
+
+          {
+            echo "## Verificação de recursos"
+            echo "- Tamanho: **$SIZE** ($CORES vCPUs, **${RAM_GB} GB RAM**, GPU NVIDIA)"
+            echo "- Cota $FAMILY: usado $USED de $LIMIT vCPUs (livres: $FREE)"
+            echo "- Disco SSD: **${DISK_GB} GB** (Premium SSD)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FREE" -lt "$CORES" ]; then
+            echo "::error::Cota insuficiente: precisa de $CORES vCPUs, só há $FREE livres. Peça aumento de cota no Azure."; exit 1
+          fi
+
+          if [ "$RAM_GB" -ne 16 ]; then
+            echo "::warning::Este tamanho tem ${RAM_GB} GB de RAM, NÃO 16 GB. O Azure não tem VM com GPU NVIDIA e exatamente 16 GB."
+          fi
+
+      - name: Criar grupo de recursos e VM Windows 11
+        if: inputs.acao == 'criar'
+        shell: bash
+        env:
+          ADMIN_PASS: ${{ secrets.VM_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$ADMIN_PASS"
+
+          az group create -n "$RG" -l "$LOC" -o none
+
+          az vm create \
+            -g "$RG" -n "$VM" -l "$LOC" \
+            --size "$SIZE" \
+            --image "MicrosoftWindowsDesktop:windows-11:win11-24h2-pro:latest" \
+            --license-type Windows_Client \
+            --admin-username "$ADMIN_USER" \
+            --admin-password "$ADMIN_PASS" \
+            --os-disk-size-gb "$DISK_GB" \
+            --storage-sku Premium_LRS \
+            --public-ip-sku Standard \
+            --nsg-rule NONE \
+            --security-type Standard \
+            -o none
+
+          echo "VM criada com disco de ${DISK_GB} GB."
+
+      - name: Instalar driver de GPU NVIDIA (GRID)
+        if: inputs.acao == 'criar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az vm extension set \
+            -g "$RG" --vm-name "$VM" \
+            --publisher Microsoft.HpcCompute \
+            --name NvidiaGpuDriverWindows \
+            --version 1.6 \
+            --settings '{}' \
+            -o none
+
+      - name: Configurar Windows e conectar ao Tailscale
+        if: inputs.acao == 'criar'
+        shell: bash
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$TS_KEY"
+
+          read -r -d '' PS_SCRIPT <<'PSEOF' || true
+          $ErrorActionPreference = 'Stop'
+          powercfg /setactive SCHEME_MIN
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          $msi = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          Start-Sleep -Seconds 10
+          & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key='__TSKEY__' --hostname='__HOST__' --unattended --accept-routes
+          PSEOF
+
+          PS_SCRIPT="${PS_SCRIPT//__TSKEY__/$TS_KEY}"
+          PS_SCRIPT="${PS_SCRIPT//__HOST__/$VM}"
+          B64=$(printf '%s' "$PS_SCRIPT" | sed 's/^          //' | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
+          echo "::add-mask::$B64"
+
+          CMD="powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $B64"
+          jq -n --arg c "$CMD" '{commandToExecute: $c}' > /tmp/protected.json
+
+          az vm extension set \
+            -g "$RG" --vm-name "$VM" \
+            --publisher Microsoft.Compute \
+            --name CustomScriptExtension \
+            --version 1.10 \
+            --protected-settings /tmp/protected.json \
+            -o none
+          rm -f /tmp/protected.json
+
+      - name: Resumo da criação
+        if: inputs.acao == 'criar'
+        shell: bash
+        run: |
+          {
+            echo "## ✅ PC criado: $VM"
+            echo "- Procure a máquina **$VM** no painel do Tailscale."
+            echo "- Conecte por RDP no IP Tailscale com o usuário **$ADMIN_USER**."
+            echo "- Para jogos, use Parsec ou Sunshine+Moonlight."
+            echo "- Desligar libera a cobrança de CPU/GPU, mas o disco continua cobrado."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Status da VM
+        if: inputs.acao == 'status'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! az vm show -g "$RG" -n "$VM" >/dev/null 2>&1; then
+            echo "::warning::VM $VM não existe em $RG."
+            echo "## ℹ️ A VM $VM não existe em $RG" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          STATE=$(az vm get-instance-view -g "$RG" -n "$VM" --query "instanceView.statuses[?starts_with(code,'PowerState/')].displayStatus | [0]" -o tsv)
+          INFO=$(az vm show -g "$RG" -n "$VM" -o json)
+          VMSIZE=$(echo "$INFO" | jq -r '.hardwareProfile.vmSize')
+          DISK=$(echo "$INFO" | jq -r '.storageProfile.osDisk.diskSizeGb')
+          LOCATION=$(echo "$INFO" | jq -r '.location')
+          SIZE_INFO=$(az vm list-sizes -l "$LOCATION" --query "[?name=='$VMSIZE'] | [0]" -o json)
+          CORES=$(echo "$SIZE_INFO" | jq -r '.numberOfCores')
+          RAM_GB=$(( $(echo "$SIZE_INFO" | jq -r '.memoryInMb') / 1024 ))
+          GPU_EXT=$(az vm extension show -g "$RG" --vm-name "$VM" -n NvidiaGpuDriverWindows --query provisioningState -o tsv 2>/dev/null || echo "não instalado")
+
+          TS_IP="(VM desligada)"
+          if [ "$STATE" = "VM running" ]; then
+            TS_IP=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+              --scripts "& 'C:\Program Files\Tailscale\tailscale.exe' ip -4" \
+              --query "value[0].message" -o tsv 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            [ -n "$TS_IP" ] || TS_IP="(Tailscale ainda não conectado)"
+          fi
+
+          {
+            echo "## Status de $VM"
+            echo "| Item | Valor |"
+            echo "|---|---|"
+            echo "| Estado | $STATE |"
+            echo "| Tamanho | $VMSIZE ($CORES vCPUs, ${RAM_GB} GB RAM) |"
+            echo "| Disco do sistema | ${DISK} GB |"
+            echo "| Região | $LOCATION |"
+            echo "| Driver NVIDIA | $GPU_EXT |"
+            echo "| IP Tailscale | $TS_IP |"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Ligar
+        if: inputs.acao == 'ligar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az vm start -g "$RG" -n "$VM"
+          echo "## ▶️ $VM ligada." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Desligar (desalocar)
+        if: inputs.acao == 'desligar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az vm deallocate -g "$RG" -n "$VM"
+          echo "## ⏹️ $VM desalocada." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Reiniciar
+        if: inputs.acao == 'reiniciar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          az vm restart -g "$RG" -n "$VM"
+          echo "## 🔄 $VM reiniciada." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Destruir VM e todos os recursos
+        if: inputs.acao == 'destruir'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(az group exists -n "$RG")" = "true" ]; then
+            az group delete -n "$RG" --yes
+            echo "## 🗑️ Grupo $RG excluído." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning::O grupo $RG não existe."
+          fi
