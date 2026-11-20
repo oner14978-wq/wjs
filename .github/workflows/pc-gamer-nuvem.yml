@@ -86,7 +86,7 @@ jobs:
   gerenciar:
     name: ${{ inputs.acao }} → ${{ inputs.nome_vm }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     steps:
       - name: Validar entradas e secrets
         shell: bash
@@ -179,6 +179,7 @@ jobs:
 
       - name: Criar grupo de recursos e VM Windows 11
         if: inputs.acao == 'criar'
+        timeout-minutes: 30
         shell: bash
         env:
           ADMIN_PASS: ${{ secrets.VM_ADMIN_PASSWORD }}
@@ -203,19 +204,31 @@ jobs:
 
       - name: Instalar driver de GPU NVIDIA (GRID)
         if: inputs.acao == 'criar'
+        timeout-minutes: 40
         shell: bash
         run: |
-          set -euo pipefail
-          az vm extension set \
-            -g "$RG" --vm-name "$VM" \
-            --publisher Microsoft.HpcCompute \
-            --name NvidiaGpuDriverWindows \
-            --version 1.6 \
-            --settings '{}' \
-            -o none
+          set -uo pipefail
+          for TENTATIVA in 1 2 3; do
+            echo "Instalando driver NVIDIA (tentativa $TENTATIVA/3)..."
+            if timeout 20m az vm extension set \
+              -g "$RG" --vm-name "$VM" \
+              --publisher Microsoft.HpcCompute \
+              --name NvidiaGpuDriverWindows \
+              --version 1.6 \
+              --settings '{}' \
+              -o none; then
+              echo "Driver NVIDIA instalado."
+              exit 0
+            fi
+            echo "::warning::Tempo esgotado ou falha na tentativa $TENTATIVA. Aguardando 60s..."
+            sleep 60
+          done
+          echo "::error::Não foi possível instalar o driver NVIDIA após 3 tentativas."
+          exit 1
 
       - name: Configurar Windows, criar conta Rafael e conectar ao Tailscale
         if: inputs.acao == 'criar'
+        timeout-minutes: 30
         shell: bash
         env:
           TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
@@ -238,11 +251,24 @@ jobs:
           }
           Add-LocalGroupMember -Group 'Administrators' -Member 'Rafael' -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'Rafael' -ErrorAction SilentlyContinue
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
           $msi = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+          $ok = $false
+          for ($i = 1; $i -le 5 -and -not $ok; $i++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi' -OutFile $msi
+              $ok = $true
+            } catch { Start-Sleep -Seconds 15 }
+          }
+          if (-not $ok) { throw 'Falha ao baixar o Tailscale' }
           Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-          Start-Sleep -Seconds 10
-          & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key='__TSKEY__' --hostname='__HOST__' --unattended --accept-routes
+          Start-Sleep -Seconds 20
+          $ts = 'C:\Program Files\Tailscale\tailscale.exe'
+          for ($i = 1; $i -le 5; $i++) {
+            & $ts up --auth-key='__TSKEY__' --hostname='__HOST__' --unattended --accept-routes
+            if ($LASTEXITCODE -eq 0) { break }
+            Start-Sleep -Seconds 15
+          }
           PSEOF
           PS_SCRIPT="${PS_SCRIPT//__TSKEY__/$TS_KEY}"
           PS_SCRIPT="${PS_SCRIPT//__HOST__/$VM}"
@@ -274,6 +300,7 @@ jobs:
 
       - name: Status da VM
         if: inputs.acao == 'status'
+        timeout-minutes: 15
         shell: bash
         run: |
           set -euo pipefail
@@ -293,7 +320,7 @@ jobs:
           GPU_EXT=$(az vm extension show -g "$RG" --vm-name "$VM" -n NvidiaGpuDriverWindows --query provisioningState -o tsv 2>/dev/null || echo "não instalado")
           TS_IP="(VM desligada)"
           if [ "$STATE" = "VM running" ]; then
-            TS_IP=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
+            TS_IP=$(timeout 5m az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
               --scripts "& 'C:\Program Files\Tailscale\tailscale.exe' ip -4" \
               --query "value[0].message" -o tsv 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
             [ -n "$TS_IP" ] || TS_IP="(Tailscale ainda não conectado)"
