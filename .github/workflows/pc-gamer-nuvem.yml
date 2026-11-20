@@ -2,14 +2,25 @@ name: PC Gamer na Nuvem (Azure + Tailscale)
 
 # Secrets necessarios:
 #   AZURE_CREDENTIALS  -> JSON do Service Principal (az ad sp create-for-rbac --sdk-auth)
-#   VM_ADMIN_PASSWORD  -> senha do administrador inicial (so para 'criar')
 #   TAILSCALE_AUTH_KEY -> chave tskey-auth-... (so para 'criar')
-# Conta extra criada no Windows: Rafael / senha 162354
+# As senhas (administrador inicial e usuario Rafael) sao geradas
+# automaticamente e mostradas no log e no resumo da execucao.
+# Use um repositorio PRIVADO, pois quem ve os logs ve as senhas.
 
 on:
   workflow_dispatch:
     inputs:
-      a
+      acao:
+        description: "Ação"
+        type: choice
+        default: status
+        options:
+          - criar
+          - status
+          - ligar
+          - desligar
+          - reiniciar
+          - destruir
       nome_vm:
         description: "Nome da VM (máx. 15 caracteres)"
         type: string
@@ -81,7 +92,6 @@ jobs:
         shell: bash
         env:
           S_AZURE: ${{ secrets.AZURE_CREDENTIALS }}
-          S_PASS: ${{ secrets.VM_ADMIN_PASSWORD }}
           S_TS: ${{ secrets.TAILSCALE_AUTH_KEY }}
           CONFIRMAR: ${{ inputs.confirmar_destruir }}
         run: |
@@ -103,9 +113,6 @@ jobs:
             esac
           fi
           if [ "$ACAO" = "criar" ]; then
-            if [ -z "$S_PASS" ]; then
-              echo "::error::Secret VM_ADMIN_PASSWORD não configurado."; ERROS=1
-            fi
             if [ -z "$S_TS" ]; then
               echo "::error::Secret TAILSCALE_AUTH_KEY não configurado."; ERROS=1
             else
@@ -125,6 +132,26 @@ jobs:
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Gerar senhas
+        if: inputs.acao == 'criar'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gen() { echo "Aa1-$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c 16)"; }
+          ADMIN_PASS=$(gen)
+          RAFAEL_PASS=$(gen)
+          echo "ADMIN_PASS=$ADMIN_PASS" >> "$GITHUB_ENV"
+          echo "RAFAEL_PASS=$RAFAEL_PASS" >> "$GITHUB_ENV"
+          echo "=========================================="
+          echo "Senha do usuário $ADMIN_USER: $ADMIN_PASS"
+          echo "Senha do usuário Rafael: $RAFAEL_PASS"
+          echo "=========================================="
+          {
+            echo "## 🔑 Senhas geradas"
+            echo "- **$ADMIN_USER**: \`$ADMIN_PASS\`"
+            echo "- **Rafael**: \`$RAFAEL_PASS\`"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verificar GPU, restrições e cota
         if: inputs.acao == 'criar'
@@ -170,11 +197,8 @@ jobs:
         if: inputs.acao == 'criar'
         timeout-minutes: 30
         shell: bash
-        env:
-          ADMIN_PASS: ${{ secrets.VM_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
-          echo "::add-mask::$ADMIN_PASS"
           az group create -n "$RG" -l "$LOC" -o none
           az vm create \
             -g "$RG" -n "$VM" -l "$LOC" \
@@ -231,10 +255,7 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
           powercfg /change standby-timeout-ac 0
           powercfg /change monitor-timeout-ac 0
-          secedit /export /cfg "$env:TEMP\sec.cfg" | Out-Null
-          (Get-Content "$env:TEMP\sec.cfg") -replace 'PasswordComplexity = 1','PasswordComplexity = 0' -replace 'MinimumPasswordLength = \d+','MinimumPasswordLength = 0' | Set-Content "$env:TEMP\sec.cfg"
-          secedit /configure /db "$env:windir\security\local.sdb" /cfg "$env:TEMP\sec.cfg" /areas SECURITYPOLICY | Out-Null
-          $pw = ConvertTo-SecureString '162354' -AsPlainText -Force
+          $pw = ConvertTo-SecureString '__RAFAELPW__' -AsPlainText -Force
           if (-not (Get-LocalUser -Name 'Rafael' -ErrorAction SilentlyContinue)) {
             New-LocalUser -Name 'Rafael' -Password $pw -FullName 'Rafael' -PasswordNeverExpires -AccountNeverExpires | Out-Null
           }
@@ -261,6 +282,7 @@ jobs:
           PSEOF
           PS_SCRIPT="${PS_SCRIPT//__TSKEY__/$TS_KEY}"
           PS_SCRIPT="${PS_SCRIPT//__HOST__/$VM}"
+          PS_SCRIPT="${PS_SCRIPT//__RAFAELPW__/$RAFAEL_PASS}"
           B64=$(printf '%s' "$PS_SCRIPT" | sed 's/^          //' | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
           echo "::add-mask::$B64"
           CMD="powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $B64"
@@ -281,7 +303,7 @@ jobs:
           {
             echo "## ✅ PC criado: $VM"
             echo "- Procure a máquina **$VM** no painel do Tailscale."
-            echo "- Conecte por RDP no IP Tailscale com o usuário **Rafael** (senha 162354)."
+            echo "- Conecte por RDP no IP Tailscale com o usuário **Rafael** (senha no resumo acima)."
             echo "- O administrador inicial **$ADMIN_USER** também continua disponível."
             echo "- Para jogos, use Parsec ou Sunshine+Moonlight."
             echo "- Desligar libera a cobrança de CPU/GPU, mas o disco continua cobrado."
