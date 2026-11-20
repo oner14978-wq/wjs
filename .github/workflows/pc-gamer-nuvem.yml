@@ -9,18 +9,7 @@ name: PC Gamer na Nuvem (Azure + Tailscale)
 on:
   workflow_dispatch:
     inputs:
-      acao:
-        description: "Operação a executar"
-        type: choice
-        required: true
-        default: status
-        options:
-          - criar
-          - status
-          - ligar
-          - desligar
-          - reiniciar
-          - destruir
+      a
       nome_vm:
         description: "Nome da VM (máx. 15 caracteres)"
         type: string
