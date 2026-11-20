@@ -1,6 +1,6 @@
 name: PC Gamer na Nuvem (Azure + Tailscale)
 
-# Secrets necessários: AZURE_CREDENTIALS, VM_ADMIN_PASSWORD, TAILSCALE_AUTH_KEY
+# Secrets necessarios: AZURE_CREDENTIALS, VM_ADMIN_PASSWORD, TAILSCALE_AUTH_KEY
 
 on:
   workflow_dispatch:
@@ -84,24 +84,43 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - name: Validar entradas
+      - name: Validar entradas e secrets
         shell: bash
+        env:
+          S_AZURE: ${{ secrets.AZURE_CREDENTIALS }}
+          S_PASS: ${{ secrets.VM_ADMIN_PASSWORD }}
+          S_TS: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          CONFIRMAR: ${{ inputs.confirmar_destruir }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          ERROS=0
           if ! [[ "$VM" =~ ^[a-zA-Z][a-zA-Z0-9-]{0,14}$ ]]; then
-            echo "::error::Nome da VM inválido."; exit 1
+            echo "::error::Nome da VM inválido (até 15 caracteres: letras, números e hífen)."; ERROS=1
           fi
           if ! [[ "$DISK_GB" =~ ^[0-9]+$ ]] || [ "$DISK_GB" -lt 127 ] || [ "$DISK_GB" -gt 4095 ]; then
-            echo "::error::disco_gb deve ser entre 127 e 4095."; exit 1
+            echo "::error::disco_gb deve ser um número entre 127 e 4095."; ERROS=1
+          fi
+          if [ -z "$S_AZURE" ]; then
+            echo "::error::Secret AZURE_CREDENTIALS não configurado."; ERROS=1
           fi
           if [ "$ACAO" = "criar" ]; then
-            [ -n "${{ secrets.VM_ADMIN_PASSWORD }}" ] || { echo "::error::Secret VM_ADMIN_PASSWORD não configurado."; exit 1; }
-            [ -n "${{ secrets.TAILSCALE_AUTH_KEY }}" ] || { echo "::error::Secret TAILSCALE_AUTH_KEY não configurado."; exit 1; }
+            if [ -z "$S_PASS" ]; then
+              echo "::error::Secret VM_ADMIN_PASSWORD não configurado."; ERROS=1
+            fi
+            if [ -z "$S_TS" ]; then
+              echo "::error::Secret TAILSCALE_AUTH_KEY não configurado."; ERROS=1
+            else
+              case "$S_TS" in
+                tskey-auth-*) ;;
+                *) echo "::error::TAILSCALE_AUTH_KEY inválido: precisa começar com tskey-auth-"; ERROS=1 ;;
+              esac
+            fi
           fi
-          [ -n "${{ secrets.AZURE_CREDENTIALS }}" ] || { echo "::error::Secret AZURE_CREDENTIALS não configurado."; exit 1; }
-          if [ "$ACAO" = "destruir" ] && [ "${{ inputs.confirmar_destruir }}" != "DESTRUIR" ]; then
-            echo "::error::Para destruir, preencha confirmar_destruir com DESTRUIR."; exit 1
+          if [ "$ACAO" = "destruir" ] && [ "$CONFIRMAR" != "DESTRUIR" ]; then
+            echo "::error::Para destruir, preencha confirmar_destruir com DESTRUIR."; ERROS=1
           fi
+          if [ "$ERROS" -ne 0 ]; then exit 1; fi
+          echo "Validação OK."
 
       - name: Login no Azure
         uses: azure/login@v2
@@ -113,27 +132,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if az vm show -g "$RG" -n "$VM" >/dev/null 2>&1; then
             echo "::error::A VM $VM já existe em $RG."; exit 1
           fi
-
           SKU_JSON=$(az vm list-skus -l "$LOC" --size "$SIZE" --resource-type virtualMachines -o json)
           if [ "$(echo "$SKU_JSON" | jq 'length')" = "0" ]; then
             echo "::error::O tamanho $SIZE NÃO existe em $LOC. Sem GPU disponível lá."; exit 1
           fi
-
           RESTR=$(echo "$SKU_JSON" | jq '[.[0].restrictions[]? | select(.type=="Location" or .type=="Zone")] | length')
           if [ "$RESTR" != "0" ]; then
             echo "::error::O tamanho $SIZE está RESTRITO na sua assinatura em $LOC (sem GPU disponível)."; exit 1
           fi
-
           FAMILY=$(echo "$SKU_JSON" | jq -r '.[0].family')
           SIZE_INFO=$(az vm list-sizes -l "$LOC" --query "[?name=='$SIZE'] | [0]" -o json)
           CORES=$(echo "$SIZE_INFO" | jq -r '.numberOfCores')
-          RAM_MB=$(echo "$SIZE_INFO" | jq -r '.memoryInMb')
-          RAM_GB=$(( RAM_MB / 1024 ))
-
+          RAM_GB=$(( $(echo "$SIZE_INFO" | jq -r '.memoryInMb') / 1024 ))
           USAGE=$(az vm list-usage -l "$LOC" --query "[?name.value=='$FAMILY'] | [0]" -o json)
           if [ "$USAGE" = "null" ] || [ -z "$USAGE" ]; then
             echo "::error::Sem informação de cota para $FAMILY em $LOC."; exit 1
@@ -141,18 +154,15 @@ jobs:
           LIMIT=$(echo "$USAGE" | jq -r '.limit')
           USED=$(echo "$USAGE" | jq -r '.currentValue')
           FREE=$(( LIMIT - USED ))
-
           {
             echo "## Verificação de recursos"
             echo "- Tamanho: **$SIZE** ($CORES vCPUs, **${RAM_GB} GB RAM**, GPU NVIDIA)"
             echo "- Cota $FAMILY: usado $USED de $LIMIT vCPUs (livres: $FREE)"
             echo "- Disco SSD: **${DISK_GB} GB** (Premium SSD)"
           } >> "$GITHUB_STEP_SUMMARY"
-
           if [ "$FREE" -lt "$CORES" ]; then
             echo "::error::Cota insuficiente: precisa de $CORES vCPUs, só há $FREE livres. Peça aumento de cota no Azure."; exit 1
           fi
-
           if [ "$RAM_GB" -ne 16 ]; then
             echo "::warning::Este tamanho tem ${RAM_GB} GB de RAM, NÃO 16 GB. O Azure não tem VM com GPU NVIDIA e exatamente 16 GB."
           fi
@@ -165,9 +175,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "::add-mask::$ADMIN_PASS"
-
           az group create -n "$RG" -l "$LOC" -o none
-
           az vm create \
             -g "$RG" -n "$VM" -l "$LOC" \
             --size "$SIZE" \
@@ -181,7 +189,6 @@ jobs:
             --nsg-rule NONE \
             --security-type Standard \
             -o none
-
           echo "VM criada com disco de ${DISK_GB} GB."
 
       - name: Instalar driver de GPU NVIDIA (GRID)
@@ -205,7 +212,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "::add-mask::$TS_KEY"
-
           read -r -d '' PS_SCRIPT <<'PSEOF' || true
           $ErrorActionPreference = 'Stop'
           powercfg /setactive SCHEME_MIN
@@ -219,15 +225,12 @@ jobs:
           Start-Sleep -Seconds 10
           & 'C:\Program Files\Tailscale\tailscale.exe' up --auth-key='__TSKEY__' --hostname='__HOST__' --unattended --accept-routes
           PSEOF
-
           PS_SCRIPT="${PS_SCRIPT//__TSKEY__/$TS_KEY}"
           PS_SCRIPT="${PS_SCRIPT//__HOST__/$VM}"
           B64=$(printf '%s' "$PS_SCRIPT" | sed 's/^          //' | iconv -f UTF-8 -t UTF-16LE | base64 -w0)
           echo "::add-mask::$B64"
-
           CMD="powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $B64"
           jq -n --arg c "$CMD" '{commandToExecute: $c}' > /tmp/protected.json
-
           az vm extension set \
             -g "$RG" --vm-name "$VM" \
             --publisher Microsoft.Compute \
@@ -268,7 +271,6 @@ jobs:
           CORES=$(echo "$SIZE_INFO" | jq -r '.numberOfCores')
           RAM_GB=$(( $(echo "$SIZE_INFO" | jq -r '.memoryInMb') / 1024 ))
           GPU_EXT=$(az vm extension show -g "$RG" --vm-name "$VM" -n NvidiaGpuDriverWindows --query provisioningState -o tsv 2>/dev/null || echo "não instalado")
-
           TS_IP="(VM desligada)"
           if [ "$STATE" = "VM running" ]; then
             TS_IP=$(az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript \
@@ -276,7 +278,6 @@ jobs:
               --query "value[0].message" -o tsv 2>/dev/null | tr -d '\r' | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
             [ -n "$TS_IP" ] || TS_IP="(Tailscale ainda não conectado)"
           fi
-
           {
             echo "## Status de $VM"
             echo "| Item | Valor |"
@@ -324,3 +325,4 @@ jobs:
           else
             echo "::warning::O grupo $RG não existe."
           fi
+          
